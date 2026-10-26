@@ -1,0 +1,33 @@
+# Helper for `gh cache-download` (https://github.com/Jwrede/gh-cache-download).
+# It reads one Actions cache entry and uploads the archive as an artifact.
+name: cache-download
+run-name: cache-download ${{ inputs.request }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      key:
+        description: Exact cache key
+        required: true
+      version:
+        description: Cache version (empty = look it up by key)
+        required: false
+        default: ''
+      request:
+        description: Request id set by gh cache-download
+        required: false
+        default: manual
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Jwrede/gh-cache-download@v1
+        with:
+          key: ${{ inputs.key }}
+          version: ${{ inputs.version }}
+          artifact-name: cache-${{ inputs.request }}

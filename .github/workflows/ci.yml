@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+      - run: node --test tests/fetch-cache.test.js
+
+  # Saves a real cache entry, downloads it with the action, and extracts it with the CLI.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create cached files inside and outside the workspace
+        run: |
+          mkdir -p e2e-data/sub ~/.e2e-home
+          echo "inside $GITHUB_RUN_ID" > e2e-data/sub/a.txt
+          ln -s sub/a.txt e2e-data/link
+          echo "outside $GITHUB_RUN_ID" > ~/.e2e-home/b.txt
+      - uses: actions/cache/save@v6
+        with:
+          key: e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            e2e-data
+            ~/.e2e-home
+      - id: dl
+        uses: ./
+        with:
+          key: e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          artifact-name: e2e-archive
+      - uses: actions/download-artifact@v8
+        with:
+          name: e2e-archive
+          path: downloaded
+      - name: Extract and compare
+        run: |
+          ls -l downloaded
+          ./gh-cache-download extract downloaded/cache.* out
+          find out -print | sort
+          test "$(cat out/e2e-data/sub/a.txt)" = "inside $GITHUB_RUN_ID"
+          test "$(cat out/e2e-data/link)" = "inside $GITHUB_RUN_ID"
+          test "$(cat out/__parent__/__parent__/__parent__/.e2e-home/b.txt)" = "outside $GITHUB_RUN_ID"
+          test "${{ steps.dl.outputs.size }}" = "$(stat -c %s downloaded/cache.*)"

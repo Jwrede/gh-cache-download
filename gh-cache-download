@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""gh cache-download: download a GitHub Actions cache entry to the local machine.
+
+The cache service only serves archives to workflow runs, so this extension dispatches
+a small helper workflow (.github/workflows/cache-download.yml) on the branch that owns
+the cache, waits for it, and downloads the archive it uploads as an artifact.
+"""
+
+import argparse
+import gzip
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import time
+import uuid
+from urllib.parse import quote
+
+__version__ = "0.1.0"
+
+WORKFLOW_FILE = "cache-download.yml"
+WORKFLOW_PATH = os.path.join(".github", "workflows", WORKFLOW_FILE)
+ACTION_REF = "Jwrede/gh-cache-download@v1"
+
+WORKFLOW_TEMPLATE = """\
+# Helper for `gh cache-download` (https://github.com/Jwrede/gh-cache-download).
+# It reads one Actions cache entry and uploads the archive as an artifact.
+name: cache-download
+run-name: cache-download ${{{{ inputs.request }}}}
+
+on:
+  workflow_dispatch:
+    inputs:
+      key:
+        description: Exact cache key
+        required: true
+      version:
+        description: Cache version (empty = look it up by key)
+        required: false
+        default: ''
+      request:
+        description: Request id set by gh cache-download
+        required: false
+        default: manual
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: {action}
+        with:
+          key: ${{{{ inputs.key }}}}
+          version: ${{{{ inputs.version }}}}
+          artifact-name: cache-${{{{ inputs.request }}}}
+"""
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+class Error(Exception):
+    pass
+
+
+def workflow_text(action=ACTION_REF):
+    return WORKFLOW_TEMPLATE.format(action=action)
+
+
+def gh(*args, check=True, timeout=120):
+    try:
+        proc = subprocess.run(
+            ["gh", *args], capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise Error(f"gh {' '.join(args)} timed out after {timeout}s")
+    if check and proc.returncode != 0:
+        raise Error(f"gh {' '.join(args)} failed:\n{proc.stderr.strip()}")
+    return proc
+
+
+def current_repo():
+    out = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
+    return out.stdout.strip()
+
+
+def list_caches(repo, key):
+    out = gh(
+        "api",
+        "--paginate",
+        f"repos/{repo}/actions/caches?key={quote(key, safe='')}&per_page=100",
+        "--jq",
+        ".actions_caches[]",
+    )
+    return [json.loads(line) for line in out.stdout.splitlines() if line.strip()]
+
+
+def normalize_ref(ref):
+    if ref is None or ref.startswith("refs/"):
+        return ref
+    return "refs/heads/" + ref
+
+
+def describe(c):
+    return (
+        f"  {c['ref']}  version {c['version'][:12]}  "
+        f"{c['size_in_bytes']} bytes  created {c['created_at']}"
+    )
+
+
+def select_cache(caches, key, ref=None, version=None):
+    """Return the single cache entry matching key (and ref/version if given)."""
+    exact = [c for c in caches if c["key"] == key]
+    if not exact:
+        msg = f'No cache entry with key "{key}".'
+        similar = sorted({c["key"] for c in caches})[:10]
+        if similar:
+            msg += " Keys starting with it:\n" + "\n".join("  " + k for k in similar)
+        raise Error(msg)
+    ref = normalize_ref(ref)
+    if ref:
+        exact = [c for c in exact if c["ref"] == ref]
+    if version:
+        exact = [c for c in exact if c["version"].startswith(version)]
+    if not exact:
+        raise Error(f'No cache entry with key "{key}" matches the given --ref/--version.')
+    if len(exact) > 1:
+        raise Error(
+            f'Key "{key}" has {len(exact)} entries; choose one with --ref or --version:\n'
+            + "\n".join(describe(c) for c in exact)
+        )
+    return exact[0]
+
+
+def dispatch_ref(cache_ref):
+    for prefix in ("refs/heads/", "refs/tags/"):
+        if cache_ref.startswith(prefix):
+            return cache_ref[len(prefix):]
+    if cache_ref.startswith("refs/pull/"):
+        raise Error(
+            f"This cache belongs to {cache_ref}. Caches of pull request merge refs can only "
+            "be read by runs of that pull request, which a manual dispatch cannot start. "
+            "Add the action to the pull request's workflow instead (see README)."
+        )
+    raise Error(f"Unsupported cache ref {cache_ref}.")
+
+
+def find_run(repo, request_id, attempts=30, delay=2.0, sleep=time.sleep):
+    for _ in range(attempts):
+        out = gh(
+            "run", "list", "-R", repo, "--workflow", WORKFLOW_FILE,
+            "--event", "workflow_dispatch", "--limit", "30",
+            "--json", "databaseId,displayTitle",
+        )
+        for run in json.loads(out.stdout or "[]"):
+            if request_id in run.get("displayTitle", ""):
+                return run["databaseId"]
+        sleep(delay)
+    raise Error(f"The dispatched run (request {request_id}) did not appear within {attempts * delay:.0f}s.")
+
+
+def archive_files(directory):
+    return sorted(
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if f.startswith("cache.") and f != "cache.partial"
+    )
+
+
+def safe_member_name(name):
+    """Map an archive path into the extraction directory.
+
+    actions/cache stores paths relative to GITHUB_WORKSPACE, so caches of ~/.npm and
+    similar contain ../ components. Each .. becomes a __parent__ directory.
+    """
+    parts = []
+    for part in name.replace("\\", "/").split("/"):
+        if part in ("", "."):
+            continue
+        parts.append("__parent__" if part == ".." else part)
+    return "/".join(parts)
+
+
+def open_tar_stream(path):
+    """Return (file object with the uncompressed tar stream, process or None)."""
+    with open(path, "rb") as f:
+        head = f.read(4)
+    if head.startswith(GZIP_MAGIC):
+        return gzip.open(path, "rb"), None
+    if head == ZSTD_MAGIC:
+        # actions/cache compresses with --long=30, whose 1 GiB window exceeds the
+        # default decoder limit.
+        try:
+            from compression import zstd  # Python 3.14+
+
+            options = {zstd.DecompressionParameter.window_log_max: 31}
+            return zstd.open(path, "rb", options=options), None
+        except ImportError:
+            pass
+        try:
+            proc = subprocess.Popen(
+                ["zstd", "-dc", "--long=31", "--", path], stdout=subprocess.PIPE
+            )
+        except FileNotFoundError:
+            raise Error("This archive is zstd-compressed; install zstd or use Python 3.14+.")
+        return proc.stdout, proc
+    return open(path, "rb"), None
+
+
+def extract(archive, dest, log=print):
+    os.makedirs(dest, exist_ok=True)
+    stream, proc = open_tar_stream(archive)
+    count = skipped = 0
+    try:
+        with tarfile.open(fileobj=stream, mode="r|") as tf:
+            for member in tf:
+                name = safe_member_name(member.name)
+                if not name:
+                    continue
+                changes = {"name": name}
+                if member.islnk():
+                    changes["linkname"] = safe_member_name(member.linkname)
+                member = member.replace(**changes, deep=False)
+                try:
+                    tf.extract(member, dest, filter="data")
+                    count += 1
+                except tarfile.FilterError as e:
+                    skipped += 1
+                    log(f"skipped {member.name}: {e}")
+    finally:
+        stream.close()
+        if proc is not None:
+            if proc.wait() != 0:
+                raise Error(f"zstd exited with status {proc.returncode}")
+    return count, skipped
+
+
+def cmd_init(args):
+    path = os.path.join(args.dir, WORKFLOW_PATH)
+    if os.path.exists(path) and not args.force:
+        raise Error(f"{path} exists; pass --force to overwrite it.")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(workflow_text())
+    print(f"Wrote {path}.")
+    print("Commit it and push it to the default branch and to every branch whose caches you want to download.")
+
+
+def cmd_get(args):
+    repo = args.repo or current_repo()
+    cache = select_cache(list_caches(repo, args.key), args.key, args.ref, args.version)
+    ref = dispatch_ref(cache["ref"])
+    print(f"Cache {cache['id']}: {cache['ref']}, {cache['size_in_bytes']} bytes, version {cache['version'][:12]}")
+
+    request_id = uuid.uuid4().hex[:12]
+    proc = gh(
+        "workflow", "run", WORKFLOW_FILE, "-R", repo, "--ref", ref,
+        "-f", f"key={cache['key']}", "-f", f"version={cache['version']}",
+        "-f", f"request={request_id}",
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise Error(
+            f"Could not start {WORKFLOW_FILE} on {ref}:\n{proc.stderr.strip()}\n"
+            f"The helper workflow must exist on {ref}. Create it with `gh cache-download init`."
+        )
+
+    run_id = find_run(repo, request_id)
+    print(f"Run {run_id}: https://github.com/{repo}/actions/runs/{run_id}")
+    watch = gh(
+        "run", "watch", str(run_id), "-R", repo, "--exit-status", "--interval", "5",
+        check=False, timeout=args.timeout,
+    )
+    if watch.returncode != 0:
+        raise Error(f"Run {run_id} failed. See `gh run view {run_id} -R {repo} --log-failed`.")
+
+    out_dir = args.dir or f"cache-{cache['id']}"
+    os.makedirs(out_dir, exist_ok=True)
+    gh(
+        "run", "download", str(run_id), "-R", repo, "-n", f"cache-{request_id}", "-D", out_dir,
+        timeout=args.timeout,
+    )
+    archives = archive_files(out_dir)
+    if not archives:
+        raise Error(f"The artifact of run {run_id} contained no cache archive.")
+    archive = archives[-1]
+    print(f"Archive: {archive} ({os.path.getsize(archive)} bytes)")
+    if args.extract:
+        dest = os.path.join(out_dir, "files")
+        count, skipped = extract(archive, dest)
+        print(f"Extracted {count} entries to {dest}" + (f", skipped {skipped}" if skipped else ""))
+
+
+def cmd_extract(args):
+    count, skipped = extract(args.archive, args.dest)
+    print(f"Extracted {count} entries to {args.dest}" + (f", skipped {skipped}" if skipped else ""))
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="gh cache-download",
+        description="Download a GitHub Actions cache entry to the local machine.",
+    )
+    p.add_argument("--version", action="version", version=__version__)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    g = sub.add_parser("get", help="download the cache entry with this exact key")
+    g.add_argument("key")
+    g.add_argument("-R", "--repo", help="OWNER/REPO (default: repository of the current directory)")
+    g.add_argument("--ref", help="branch or ref of the entry, when the key exists on several")
+    g.add_argument("--cache-version", dest="version", help="version (prefix) of the entry")
+    g.add_argument("-D", "--dir", help="output directory (default: cache-<id>)")
+    g.add_argument("-x", "--extract", action="store_true", help="also extract the archive into <dir>/files")
+    g.add_argument("--timeout", type=int, default=900, help="seconds to wait for the run and the download (default 900)")
+    g.set_defaults(func=cmd_get)
+
+    i = sub.add_parser("init", help=f"write {WORKFLOW_PATH}")
+    i.add_argument("--dir", default=".", help="repository root (default: .)")
+    i.add_argument("--force", action="store_true", help="overwrite an existing file")
+    i.set_defaults(func=cmd_init)
+
+    x = sub.add_parser("extract", help="extract a downloaded cache archive")
+    x.add_argument("archive")
+    x.add_argument("dest")
+    x.set_defaults(func=cmd_extract)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except Error as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
