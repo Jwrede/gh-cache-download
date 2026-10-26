@@ -2,6 +2,25 @@
 
 Download a GitHub Actions cache entry to your machine, by key, to see what is actually in it.
 
+```console
+$ gh cache list -R Jwrede/gh-cache-download
+9507487879  e2e-40288214454-1  459 B  2026-10-26T07:50:08Z  2026-10-26T07:50:10Z
+
+$ gh cache-download get e2e-40288214454-1 -R Jwrede/gh-cache-download -x
+Cache 9507487879: refs/heads/main, 459 bytes, version b107c4986568
+Run 40288300859: https://github.com/Jwrede/gh-cache-download/actions/runs/40288300859
+Archive: cache-9507487879/cache.tzst (459 bytes)
+Extracted 6 entries to cache-9507487879/files
+
+$ find cache-9507487879/files -type f -o -type l
+cache-9507487879/files/e2e-data/link
+cache-9507487879/files/e2e-data/sub/a.txt
+cache-9507487879/files/__parent__/__parent__/__parent__/.e2e-home/b.txt
+```
+
+The cache above was saved by this repository's CI from `e2e-data` (in the workspace) and
+`~/.e2e-home` (outside it). The whole `get` took 14 seconds.
+
 GitHub stores cache entries for `actions/cache`, `setup-node`, `setup-python` and similar
 actions, but there is no button, API call or `gh` command that returns the archive. The cache
 service hands out download URLs only to workflow runs. This extension starts a small helper
